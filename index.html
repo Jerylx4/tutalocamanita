@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voxel Architect - Jeryl Genial</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+    
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://public.codepenassets.com/css/reset-2.0.min.css">
+
+    <style>
+        body, html { 
+            margin: 0; padding: 0; overflow: hidden; height: 100%; width: 100%;
+            background-color: #0d0d0d; font-family: 'Montserrat', sans-serif; 
+        }
+
+        #contenedor_3d { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; }
+        #lienzo_mano { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); z-index: 3; pointer-events: none; opacity: 0.2; }
+        #video_fondo { display: none; }
+        
+        #panel-estado {
+            position: absolute; top: 20px; left: 20px; z-index: 50;
+            color: #00ffff; font-family: 'Montserrat', sans-serif; font-size: 11px; font-weight: bold;
+            white-space: pre; background-color: rgba(0, 0, 0, 0.6); padding: 12px; border-radius: 8px;
+            border: 1px solid #00ffff; text-transform: uppercase;
+        }
+
+        #paleta-colores {
+            position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+            display: flex; gap: 15px; z-index: 50;
+            background: rgba(20, 10, 15, 0.85); backdrop-filter: blur(12px); 
+            padding: 15px 25px; border-radius: 30px; border: 2px solid rgba(236, 72, 153, 0.4);
+            box-shadow: 0 8px 32px rgba(236, 72, 153, 0.2);
+            align-items: center;
+        }
+        
+        .color-btn {
+            width: 35px; height: 35px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.4);
+            cursor: pointer; transition: all 0.2s; outline: none; display: flex; justify-content: center; align-items: center; font-size: 16px;
+        }
+        
+        .color-btn.activo { transform: scale(1.3); border-color: white; box-shadow: 0 0 15px currentColor; z-index: 10; }
+        .color-btn.borrador { background: #222; border-color: #ff3333; color: #ff3333; }
+        .color-btn.borrador.activo { box-shadow: 0 0 15px #ff3333; }
+    </style>
+</head>
+<body>
+
+    <video id="video_fondo" autoplay playsinline></video>
+    <div id="contenedor_3d"></div>
+    <canvas id="lienzo_mano"></canvas>
+    
+    <div id="panel-estado">INICIANDO SISTEMA...</div>
+
+    <div id="paleta-colores">
+        <button class="color-btn activo" style="background: #ffffff; color: #ffffff;" onclick="seleccionarHerramienta('W', this)"></button>
+        <button class="color-btn" style="background: #ff3366; color: #ff3366;" onclick="seleccionarHerramienta('R', this)"></button>
+        <button class="color-btn" style="background: #222222; color: #888888;" onclick="seleccionarHerramienta('K', this)"></button>
+        <button class="color-btn" style="background: #ffcc00; color: #ffcc00;" onclick="seleccionarHerramienta('Y', this)"></button>
+        <button class="color-btn" style="background: #3366ff; color: #3366ff;" onclick="seleccionarHerramienta('B', this)"></button>
+        <div style="width: 2px; height: 30px; background: rgba(255,255,255,0.2); margin: 0 5px;"></div>
+        <button class="color-btn borrador" onclick="seleccionarHerramienta('ERASE', this)">❌</button>
+    </div>
+
+    <script>
+        const elementoVideo = document.getElementById('video_fondo');
+        const lienzoMano = document.getElementById('lienzo_mano');
+        const ctxMano = lienzoMano.getContext('2d');
+        const panelEstadoText = document.getElementById('panel-estado');
+        const contenedor3D = document.getElementById('contenedor_3d');
+
+        let escena, camara, renderizado, raycaster, punteroRaton, punteroRatonSuavizado;
+        
+        let herramientaActual = 'W';
+        const paletaColores = { 'W': 0xffffff, 'R': 0xff3366, 'K': 0x222222, 'Y': 0xffcc00, 'B': 0x3366ff };
+        const materialBordes = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 2 }); 
+        
+        let grupoConfirmados = new THREE.Group();
+        let grupoGuia = new THREE.Group(); 
+        let cursor3D;
+        let bloquesAnimando = [];
+
+        let prevManoIzquierdaX = null; 
+        let prevManoIzquierdaY = null; 
+        let ultimaPosicionPintada = new THREE.Vector3(-999, -999, -999);
+        let estadoPellizco = false;
+        let ultimoTiempoColocacion = 0; 
+
+        const kittyArt = [
+            "  WW     RR  ", " WWWW   RRRR ", "WWWWWWWWWWWWR", "WWKWWWWWKWWWW", 
+            "WWWWWYWWWWWWW", "  WWWWWWWWW  ", "   BBBBBBB   ", "   BBBBBBB   ", "   WW   WW   "  
+        ];
+
+        function seleccionarHerramienta(herramienta, botonRef) {
+            herramientaActual = herramienta;
+            document.querySelectorAll('.color-btn').forEach(btn => btn.classList.remove('activo'));
+            botonRef.classList.add('activo');
+            
+            if (herramienta === 'ERASE') {
+                cursor3D.material.color.setHex(0xff0000);
+                cursor3D.material.wireframe = true;
+                cursor3D.material.opacity = 0.8;
+            } else {
+                cursor3D.material.color.setHex(paletaColores[herramienta]);
+                cursor3D.material.wireframe = false;
+                cursor3D.material.opacity = 0.5;
+            }
+        }
+
+        function init3D() {
+            escena = new THREE.Scene();
+            escena.background = new THREE.Color(0x0d0d0d);
+
+            camara = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camara.position.set(0, 8, 18); 
+            camara.lookAt(0, 5, 0);
+
+            renderizado = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+            renderizado.setSize(window.innerWidth, window.innerHeight);
+            contenedor3D.appendChild(renderizado.domElement);
+
+            const luzAmbiental = new THREE.AmbientLight(0xffffff, 0.9);
+            escena.add(luzAmbiental);
+            const luzDir = new THREE.DirectionalLight(0xffffff, 0.6);
+            luzDir.position.set(10, 20, 10);
+            escena.add(luzDir);
+
+            // Quitamos el planoBase, ya no es necesario
+            const rejillaHelper = new THREE.GridHelper(50, 50, 0x444444, 0x222222);
+            escena.add(rejillaHelper);
+
+            escena.add(grupoConfirmados);
+            escena.add(grupoGuia);
+
+            construirGuiaFantasma();
+
+            const cursorGeom = new THREE.BoxGeometry(1.05, 1.05, 1.05); 
+            const cursorMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 });
+            cursor3D = new THREE.Mesh(cursorGeom, cursorMat);
+            cursor3D.visible = false;
+            escena.add(cursor3D);
+
+            raycaster = new THREE.Raycaster();
+            punteroRaton = new THREE.Vector2(0, 0);
+            punteroRatonSuavizado = new THREE.Vector2(0, 0);
+
+            animar3D();
+        }
+
+        function construirGuiaFantasma() {
+            const geomGuia = new THREE.BoxGeometry(0.9, 0.9, 0.9);
+            for (let row = 0; row < kittyArt.length; row++) {
+                let y = kittyArt.length - row; 
+                let fila = kittyArt[row];
+                for (let col = 0; col < fila.length; col++) {
+                    let char = fila[col];
+                    if (paletaColores[char] !== undefined) {
+                        let voxelGuia = new THREE.Mesh(geomGuia, new THREE.MeshBasicMaterial({ color: paletaColores[char], transparent: true, opacity: 0.15 }));
+                        voxelGuia.position.set(col - 6.5 + 0.5, y + 0.5, 0.5); 
+                        voxelGuia.name = "VoxelGuia";
+                        grupoGuia.add(voxelGuia);
+                    }
+                }
+            }
+        }
+
+        function animar3D() {
+            requestAnimationFrame(animar3D);
+            
+            punteroRatonSuavizado.lerp(punteroRaton, 0.25);
+            
+            if (manoDerechaDetectada) {
+                actualizarCursor3D();
+            } else {
+                cursor3D.visible = false;
+            }
+
+            for (let i = bloquesAnimando.length - 1; i >= 0; i--) {
+                let bloque = bloquesAnimando[i];
+                if (bloque.scale.x < 1) {
+                    bloque.scale.addScalar(0.18); 
+                } else {
+                    bloque.scale.set(1, 1, 1);
+                    bloquesAnimando.splice(i, 1);
+                }
+            }
+
+            renderizado.render(escena, camara);
+        }
+
+        let manoDerechaDetectada = false;
+
+        function redimensionarVistas() {
+            lienzoMano.width = window.innerWidth; lienzoMano.height = window.innerHeight;
+            camara.aspect = window.innerWidth / window.innerHeight;
+            camara.updateProjectionMatrix();
+            renderizado.setSize(window.innerWidth, window.innerHeight);
+        }
+        window.addEventListener('resize', redimensionarVistas);
+        init3D();
+        redimensionarVistas();
+
+        function actualizarPanelEstado(estado) {
+            panelEstadoText.innerText = `STATUS: ${estado}\n\n[MANO DERECHA]\nÍNDICE: APUNTAR A LA GUÍA\nPELLIZCAR: RELLENAR/BORRAR\n\n[MANO IZQUIERDA]\nPUÑO: ROTAR\nÍNDICE: Acercar\nDOS DEDOS: Alejar\n\nPIEZAS: ${grupoConfirmados.children.length}`;
+        }
+
+        function actualizarCursor3D() {
+            raycaster.setFromCamera(punteroRatonSuavizado, camara);
+            
+            // SOLO detectamos las guías (fantasma) y los bloques confirmados (ya construidos)
+            const objetosDeteccion = [...grupoConfirmados.children, ...grupoGuia.children];
+            const intersecciones = raycaster.intersectObjects(objetosDeteccion, false);
+
+            if (intersecciones.length > 0) {
+                const intersect = intersecciones[0];
+
+                if (herramientaActual === 'ERASE') {
+                    // Si estamos borrando, solo nos importa tocar los bloques confirmados
+                    if (intersect.object.name === "VoxelConfirmado") {
+                        let pos = intersect.object.position.clone();
+                        cursor3D.position.copy(pos);
+                        cursor3D.visible = true;
+                        if(cursor3D.scale.x > 1.05) cursor3D.scale.addScalar(-0.05);
+                        return pos;
+                    }
+                } else {
+                    // Modo Pintar: Solo podemos pintar en las posiciones exactas de "VoxelGuia"
+                    if (intersect.object.name === "VoxelGuia") {
+                        let pos = intersect.object.position.clone();
+                        
+                        // Verificamos si en esa posición de la guía ya hay un bloque confirmado
+                        let ocupado = grupoConfirmados.children.some(b => b.position.distanceTo(pos) < 0.1);
+                        
+                        if (!ocupado) {
+                            cursor3D.position.copy(pos);
+                            cursor3D.visible = true;
+                            if(cursor3D.scale.x > 1.05) cursor3D.scale.addScalar(-0.05);
+                            return pos;
+                        }
+                    }
+                }
+            }
+            
+            cursor3D.visible = false;
+            return null;
+        }
+
+        function procesarAccionConstruccion(posicion) {
+            const ahora = Date.now();
+            if (ahora - ultimoTiempoColocacion < 150) return; 
+
+            let bloqueExistente = grupoConfirmados.children.find(b => b.position.distanceTo(posicion) < 0.1);
+
+            if (herramientaActual === 'ERASE') {
+                if (bloqueExistente) {
+                    grupoConfirmados.remove(bloqueExistente);
+                    cursor3D.scale.set(1.4, 1.4, 1.4); 
+                    ultimoTiempoColocacion = ahora;
+                }
+            } else {
+                if (!bloqueExistente) {
+                    const mat = new THREE.MeshLambertMaterial({ color: paletaColores[herramientaActual] });
+                    const voxel = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), mat);
+                    voxel.position.copy(posicion);
+                    voxel.name = "VoxelConfirmado";
+                    
+                    const edges = new THREE.EdgesGeometry(voxel.geometry);
+                    voxel.add(new THREE.LineSegments(edges, materialBordes));
+                    
+                    voxel.scale.set(0.1, 0.1, 0.1);
+                    bloquesAnimando.push(voxel);
+                    
+                    grupoConfirmados.add(voxel);
+                    ultimoTiempoColocacion = ahora;
+                }
+            }
+        }
+
+        function calcularDistancia3D(p1, p2) {
+            let dx = p1.x - p2.x; let dy = p1.y - p2.y; let dz = p1.z - p2.z;
+            return Math.sqrt(dx*dx + dy*dy + dz*dz);
+        }
+
+        function alObtenerResultados(resultados) {
+            ctxMano.clearRect(0, 0, lienzoMano.width, lienzoMano.height);
+            let estadoActual = "APUNTANDO...";
+            manoDerechaDetectada = false;
+            
+            if (resultados.multiHandLandmarks) {
+                let manoDerecha = null; let manoIzquierda = null;
+
+                for (let i = 0; i < resultados.multiHandLandmarks.length; i++) {
+                    const mano = resultados.multiHandLandmarks[i];
+                    const etiqueta = resultados.multiHandedness[i].label; 
+                    if (etiqueta === 'Right') manoDerecha = mano;
+                    else if (etiqueta === 'Left') manoIzquierda = mano;
+
+                    const colorManoDer = herramientaActual === 'ERASE' ? '#ff3333' : '#' + paletaColores[herramientaActual].toString(16).padStart(6, '0');
+                    drawConnectors(ctxMano, mano, HAND_CONNECTIONS, { color: etiqueta === 'Right' ? colorManoDer : '#ffffff', lineWidth: 2 });
+                    drawLandmarks(ctxMano, mano, { color: '#ffffff', lineWidth: 1, radius: 2 });
+                }
+
+                // --- MANO IZQUIERDA (CÁMARA) ---
+                if (manoIzquierda) {
+                    const indiceIzUp = manoIzquierda[8].y < manoIzquierda[6].y;
+                    const medioIzUp = manoIzquierda[12].y < manoIzquierda[10].y;
+                    const anularIzUp = manoIzquierda[16].y < manoIzquierda[14].y;
+                    const meniqueIzUp = manoIzquierda[20].y < manoIzquierda[18].y;
+
+                    const puñoCerrado = !indiceIzUp && !medioIzUp && !anularIzUp && !meniqueIzUp;
+                    const soloIndice = indiceIzUp && !medioIzUp && !anularIzUp && !meniqueIzUp;
+                    const dosDedos = indiceIzUp && medioIzUp && !anularIzUp && !meniqueIzUp;
+
+                    const centroX = manoIzquierda[9].x; 
+                    const centroY = manoIzquierda[9].y; 
+
+                    if (puñoCerrado) {
+                        estadoActual = "ROTANDO CÁMARA";
+                        if (prevManoIzquierdaX !== null && prevManoIzquierdaY !== null) {
+                            const deltaX = centroX - prevManoIzquierdaX;
+                            const deltaY = centroY - prevManoIzquierdaY;
+
+                            let esferica = new THREE.Spherical().setFromVector3(camara.position);
+                            esferica.theta += deltaX * 2.0; 
+                            esferica.phi += deltaY * 2.0; 
+                            esferica.phi = Math.max(0.1, Math.min(Math.PI - 0.1, esferica.phi));
+
+                            camara.position.setFromSpherical(esferica);
+                            camara.lookAt(0, 5, 0); 
+                        }
+                        prevManoIzquierdaX = centroX; prevManoIzquierdaY = centroY;
+                    } else {
+                        prevManoIzquierdaX = null; prevManoIzquierdaY = null;
+                        if (soloIndice) {
+                            estadoActual = "ZOOM IN";
+                            if (camara.position.length() > 5) camara.position.multiplyScalar(0.96);
+                        } else if (dosDedos) {
+                            estadoActual = "ZOOM OUT";
+                            if (camara.position.length() < 80) camara.position.multiplyScalar(1.04);
+                        }
+                    }
+                } else {
+                    prevManoIzquierdaX = null; prevManoIzquierdaY = null;
+                }
+
+                // --- MANO DERECHA (PUNTAR Y PINTAR) ---
+                if (manoDerecha) {
+                    manoDerechaDetectada = true;
+                    const pulgarPunta = manoDerecha[4];
+                    const indicePunta = manoDerecha[8];
+
+                    punteroRaton.set((1.0 - indicePunta.x) * 2.0 - 1.0, -(indicePunta.y * 2.0 - 1.0));
+                    
+                    const distanciaDedos = calcularDistancia3D(pulgarPunta, indicePunta);
+                    
+                    if (!estadoPellizco && distanciaDedos < 0.04) {
+                        estadoPellizco = true;
+                    } else if (estadoPellizco && distanciaDedos > 0.06) {
+                        estadoPellizco = false;
+                        ultimaPosicionPintada.set(-999,-999,-999); 
+                    }
+
+                    if (estadoPellizco) {
+                        estadoActual = herramientaActual === 'ERASE' ? "BORRANDO..." : "PINTANDO...";
+                        let posObjetivo = actualizarCursor3D();
+                        
+                        if (posObjetivo && !posObjetivo.equals(ultimaPosicionPintada)) {
+                            procesarAccionConstruccion(posObjetivo);
+                            ultimaPosicionPintada.copy(posObjetivo);
+                        }
+                    }
+                }
+            }
+            
+            actualizarPanelEstado(estadoActual);
+        }
+
+        const manos = new Hands({locateFile: (archivo) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${archivo}`});
+        manos.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        manos.onResults(alObtenerResultados);
+        new Camera(elementoVideo, { onFrame: async () => { await manos.send({image: elementoVideo}); }, width: 640, height: 480 }).start();
+    </script>
+</body>
+</html>
